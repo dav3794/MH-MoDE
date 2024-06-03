@@ -1,2 +1,2 @@
 # MH-MoDE
-Implementation of Multi-Head Mixture-of-Depths-and-Experts for NLP course.
+Implementation of Multi-Head Mixture-of-Depths-and-Experts for group project in NLP course.
