@@ -4,27 +4,8 @@ from transformers import PretrainedConfig
 import torch.nn.functional as F
 from einops import einsum, rearrange
 import math
-import random
-import numpy as np
 from copy import deepcopy
-
-def seed_all(seed: int = 0) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def get_gpu_device() -> torch.device:
-    if torch.cuda.is_available():
-        device_str = "cuda"     # GPU
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device_str = "mps"      # Apple silicon
-    else:
-        print("Warning: No GPU found, using CPU instead.")
-        device_str = "cpu"      # CPU
-    return torch.device(device_str)
+from time import time
 
 
 class MLP(nn.Module):
@@ -84,9 +65,13 @@ class MoE(nn.Module):
         x_flat = x.view(-1, hidden_size)
         weights_flat = routing_weights.view(-1, self.num_experts)
 
-        routing_mask = (weights_flat > 0).int()
-        sorted_mask, sorted_indices = torch.sort(routing_mask, dim=0, descending=True)
+        # Get top-k experts for each token
+        non_zero_experts = torch.topk(weights_flat, self.num_experts_per_token, dim=-1)
+        topk_flat_weights = torch.zeros_like(weights_flat).scatter_(-1, non_zero_experts.indices, non_zero_experts.values)
+        routing_mask = (topk_flat_weights > 0).long()
 
+        # Assign capacity tokens to experts
+        sorted_mask, sorted_indices = torch.sort(routing_mask, dim=0, descending=True)
         sorted_mask = sorted_mask[:expert_capacity]
         sorted_indices = sorted_indices[:expert_capacity]
         used_tokens_indices = sorted_indices * sorted_mask # zero indices for zero-weights tokens
@@ -94,18 +79,17 @@ class MoE(nn.Module):
 
         inputs_tokens = torch.index_select(x_flat, 0, used_tokens_indices) * sorted_mask.flatten().unsqueeze(-1)
         inputs_tokens = inputs_tokens.view(expert_capacity, self.num_experts, hidden_size)
-        inputs_weights = torch.gather(weights_flat, 0, sorted_indices)
+        inputs_weights = torch.gather(topk_flat_weights, 0, sorted_indices)
 
-        expert_inter = self.experts_inter.unsqueeze(0).expand(expert_capacity, -1, -1, -1)
-        expert_out = self.experts_out.unsqueeze(0).expand(expert_capacity, -1, -1, -1)
-
-        out = einsum(inputs_tokens, expert_inter, 'c e h, c e h i -> c e i')
+        # Compute expert outputs
+        out = einsum(inputs_tokens, self.experts_inter, 'c e h, e h i -> c e i')
         out = self.expert_activation(out)
-        out = einsum(out, expert_out, 'c e i, c e i h -> c e h')
+        out = einsum(out, self.experts_out, 'c e i, e i h -> c e h')
 
         out = out * inputs_weights.unsqueeze(-1)
-        out = out.view(-1, hidden_size)
+        out = out.reshape(-1, hidden_size)
 
+        # Collect expert token embeddings back to original shape
         expert_embeddings = torch.zeros_like(x_flat).index_add_(0, used_tokens_indices, out)
         expert_embeddings = expert_embeddings.view(batch_size, seq_len, hidden_size)
 
@@ -136,19 +120,17 @@ class MoDE(nn.Module):
         x_flat = x.view(-1, hidden_size) # [batch_size * seq_len, hidden_size]
         weights_flat = routing_weights.view(-1, self.num_experts) # [batch_size * seq_len, num_experts]
 
+        # Get top-k experts for each token
         non_zero_experts = torch.topk(weights_flat, self.num_experts_per_token, dim=-1)
         topk_flat_weights = torch.zeros_like(weights_flat).scatter_(-1, non_zero_experts.indices, non_zero_experts.values)
-        routing_mask = (topk_flat_weights > 0).int()
 
-        noop_flat_weights = topk_flat_weights[..., -1:].flatten() # no-op expert, [batch_size*seq_len]
-        noop_routing_mask = routing_mask[..., -1:].flatten()
-        routed_token_indices = torch.nonzero(noop_routing_mask).flatten()
-        noop_tokens = torch.index_select(x_flat, 0, routed_token_indices)
-        noop_weights = torch.index_select(noop_flat_weights, 0, routed_token_indices)
-        noop_routed = noop_tokens * noop_weights.unsqueeze(-1)
+        # Get no-op tokens
+        noop_flat_weights = topk_flat_weights[:, -1:] # no-op expert, [batch_size*seq_len, 1]
+        noop_routed = x_flat * noop_flat_weights # zeros for non-routed tokens
         
-        experts_flat_weights = topk_flat_weights[..., :-1] # exclude no-op expert, [batch_size*seq_len, (num_experts-1)]
-        experts_routing_mask = routing_mask[..., :-1] 
+        # Assign capacity tokens to experts
+        experts_flat_weights = topk_flat_weights[:, :-1] # exclude no-op expert, [batch_size*seq_len, (num_experts-1)]
+        experts_routing_mask = (experts_flat_weights > 0).long()
         sorted_mask, sorted_indices = torch.sort(experts_routing_mask, dim=0, descending=True) # stable=False by default
         sorted_mask = sorted_mask[:expert_capacity] # [expert_capacity, num_experts-1]
         sorted_indices = sorted_indices[:expert_capacity] # [expert_capacity, num_experts-1]
@@ -159,18 +141,17 @@ class MoDE(nn.Module):
         inputs_tokens = inputs_tokens.view(expert_capacity, self.num_experts-1, hidden_size)
         inputs_weights = torch.gather(experts_flat_weights, 0, sorted_indices)
 
-        expert_inter = self.experts_inter.unsqueeze(0).expand(expert_capacity, -1, -1, -1)
-        expert_out = self.experts_out.unsqueeze(0).expand(expert_capacity, -1, -1, -1)
-
-        out = einsum(inputs_tokens, expert_inter, 'c e h, c e h i -> c e i')
+        # Compute expert outputs
+        out = einsum(inputs_tokens, self.experts_inter, 'c e h, e h i -> c e i')
         out = self.expert_activation(out)
-        out = einsum(out, expert_out, 'c e i, c e i h -> c e h')
+        out = einsum(out, self.experts_out, 'c e i, e i h -> c e h')
 
         out = out * inputs_weights.unsqueeze(-1)
-        out = out.view(-1, hidden_size)
+        out = out.reshape(-1, hidden_size)
 
+        # Collect expert token embeddings back to original shape
         expert_embeddings = torch.zeros_like(x_flat).index_add_(0, used_tokens_indices, out) # add expert embeddings
-        expert_embeddings = expert_embeddings.index_add_(0, routed_token_indices, noop_routed) # add no-op experts
+        expert_embeddings += noop_routed
         expert_embeddings = expert_embeddings.view(batch_size, seq_len, hidden_size)
 
         return expert_embeddings
@@ -197,11 +178,14 @@ class MHMixtureWrapper(nn.Module):
         x = self.mh_input_layer(x)
         x = self.activation(x)
 
+        # Split tokens into subtokens
         x = x.view(batch_size, seq_len, self.num_heads, hidden_size // self.num_heads)
         x = x.reshape(batch_size, -1, hidden_size // self.num_heads) # [batch_size, seq_len*num_heads, hidden_size//num_heads]
 
+        # Apply FF to subtokens
         x = self.ff(x)
 
+        # Merge subtokens back to tokens
         x = x.view(batch_size, seq_len, self.num_heads, hidden_size // self.num_heads)
         x = x.reshape(batch_size, seq_len, hidden_size)
 
