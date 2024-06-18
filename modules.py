@@ -90,7 +90,7 @@ class MoE(nn.Module):
         out = out.reshape(-1, hidden_size)
 
         # Collect expert token embeddings back to original shape
-        expert_embeddings = torch.zeros_like(x_flat).index_add_(0, used_tokens_indices, out)
+        expert_embeddings = torch.zeros_like(x_flat, dtype=out.dtype).index_add_(0, used_tokens_indices, out)
         expert_embeddings = expert_embeddings.view(batch_size, seq_len, hidden_size)
 
         return expert_embeddings
@@ -150,7 +150,7 @@ class MoDE(nn.Module):
         out = out.reshape(-1, hidden_size)
 
         # Collect expert token embeddings back to original shape
-        expert_embeddings = torch.zeros_like(x_flat).index_add_(0, used_tokens_indices, out) # add expert embeddings
+        expert_embeddings = torch.zeros_like(x_flat, dtype=out.dtype).index_add_(0, used_tokens_indices, out) # add expert embeddings
         expert_embeddings += noop_routed
         expert_embeddings = expert_embeddings.view(batch_size, seq_len, hidden_size)
 
@@ -163,7 +163,7 @@ class MHMixtureWrapper(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
+        self.num_heads = 4
 
         self.mh_input_layer = nn.Linear(self.hidden_size, self.hidden_size)
         self.mh_output_layer = nn.Linear(self.hidden_size, self.hidden_size)
@@ -267,6 +267,58 @@ class TransformerClassifier(nn.Module):
         pooled_encoding = encoding.mean(dim=1)
         logits = self.classifier(pooled_encoding)
         loss = F.cross_entropy(logits, labels) if labels is not None else None
+        return {
+            'loss': loss,
+            'logits': logits,
+        }
+
+
+class TransformerForMaskedLanguageModeling(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.embeddings = Embedding(config)
+        self.layer = nn.Sequential(*[TransformerBlock(config) for _ in range(config.num_hidden_layers)])
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)  # Predict vocabulary tokens
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        embedding_output = self.embeddings(input_ids)
+        encoding = self.layer(embedding_output)
+        logits = self.lm_head(encoding)
+
+        loss = None
+        if labels is not None:
+            # Mask the logits and labels for MLM loss calculation
+            active_loss = attention_mask.view(-1) == 1  # Apply attention mask to calculate loss only on masked positions
+            active_logits = logits.view(-1, self.config.vocab_size)[active_loss]
+            active_labels = labels.view(-1)[active_loss]
+            loss = F.cross_entropy(active_logits, active_labels)
+
+        return {
+            'loss': loss,
+            'logits': logits,
+        }
+
+
+class TransformerForCausalLanguageModeling(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.embeddings = Embedding(config)
+        self.layer = nn.Sequential(*[TransformerBlock(config) for _ in range(config.num_hidden_layers)])
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)  # Predict vocabulary tokens
+
+    def forward(self, input_ids, labels=None):
+        embedding_output = self.embeddings(input_ids)
+        encoding = self.layer(embedding_output)
+        logits = self.lm_head(encoding)
+
+        loss = None
+        if labels is not None:
+            # Shift the logits and labels for CLM loss calculation
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
         return {
             'loss': loss,
             'logits': logits,
